@@ -16,7 +16,7 @@ import Control.Monad.Catch
 import Control.Monad.Fail as Fail
 import Control.Monad.Fix
 import Data.IORef
-import System.Directory(getHomeDirectory)
+import System.Directory(getXdgDirectory, XdgDirectory(XdgConfig), doesFileExist, getHomeDirectory)
 import System.FilePath
 import System.IO
 
@@ -64,6 +64,27 @@ instance ( Fail.MonadFail m ) => Fail.MonadFail (InputT m) where
 
 instance ( MonadFix m ) => MonadFix (InputT m) where
     mfix f = InputT (mfix (unInputT . f))
+
+-- | Run an action in the underlying monad, as per 'lift', passing it a runner
+-- function which restores the current 'InputT' context. This can be used in
+-- the event that we have some function that takes an action in the underlying
+-- monad as an argument (such as 'lift', 'hoist', 'forkIO', etc) and we want
+-- to compose it with actions in 'InputT'.
+withRunInBase :: Monad m =>
+    ((forall a . InputT m a -> m a) -> m b) -> InputT m b
+withRunInBase inner = InputT $ do
+    runTerm <- ask
+    history <- ask
+    killRing <- ask
+    prefs <- ask
+    settings <- ask
+    lift $ lift $ lift $ lift $ lift $ inner $
+        flip runReaderT settings .
+        flip runReaderT prefs .
+        flip runReaderT killRing .
+        flip runReaderT history .
+        flip runReaderT runTerm .
+        unInputT
 
 -- | Get the current line input history.
 getHistory :: MonadIO m => InputT m History
@@ -143,7 +164,7 @@ withBehavior (Behavior run) f = bracket (liftIO run) (liftIO . closeTerm) f
 runInputTBehavior :: (MonadIO m, MonadMask m) => Behavior -> Settings m -> InputT m a -> m a
 runInputTBehavior behavior settings f = withBehavior behavior $ \run -> do
     prefs <- if isTerminalStyle run
-                then liftIO readPrefsFromHome
+                then liftIO readUserPrefs
                 else return defaultPrefs
     execInputT prefs settings run f
 
@@ -196,10 +217,13 @@ preferTerm :: Behavior
 preferTerm = Behavior terminalRunTerm
 
 
--- | Read 'Prefs' from @~/.haskeline.@   If there is an error reading the file,
+-- | Read 'Prefs' from @$XDG_CONFIG_HOME/haskeline/haskeline@ if present
+-- ortherwise @~/.haskeline.@ If there is an error reading the file,
 -- the 'defaultPrefs' will be returned.
-readPrefsFromHome :: IO Prefs
-readPrefsFromHome = handle (\(_::IOException) -> return defaultPrefs) $ do
-    home <- getHomeDirectory
-    readPrefs (home </> ".haskeline")
+readUserPrefs :: IO Prefs
+readUserPrefs = handle (\(_::IOException) -> return defaultPrefs) $ do
+    xdg    <- getXdgDirectory XdgConfig ("haskeline/haskeline")
+    exists <- doesFileExist xdg
+    home   <- getHomeDirectory
+    readPrefs (if exists then xdg else (home </> ".haskeline"))
 
